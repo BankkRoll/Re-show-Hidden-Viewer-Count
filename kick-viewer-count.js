@@ -12,7 +12,7 @@
 
   // ── Config ──────────────────────────────────────────────────────────────
   const CONFIG = {
-    pollMs: 60_000, // endpoint is Cloudflare-cached for 60s; faster just re-reads the cache
+    pollMs: 60_000, // fallback poll; primary updates ride Kick's own request (see below)
     nodeId: 'riv-wrap', // id of our injected wrapper
     wrapClass: 'min b-h-[1.375rem] flex items-center gap-1 text-sm font-bold',
   };
@@ -46,18 +46,40 @@
     }
   };
 
-  /** Wrap fetch to capture the id from any current-viewers call the page makes. */
+  /**
+   * Wrap fetch to piggyback on the page's own current-viewers calls.
+   * This is the primary update path: we render the moment Kick gets fresh data,
+   * so we stay perfectly in sync with the cache instead of drifting against it.
+   * We also capture the id here as a fallback for the standalone poll.
+   */
   const installIdSniffer = () => {
     const original = window.fetch;
-    window.fetch = function (...args) {
-      try {
-        const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
-        const match = url && url.match(/current-viewers\?ids\[\]=(\d+)/);
-        if (match) sniffedId = Number(match[1]);
-      } catch {
-        /* ignore */
+    window.fetch = async function (...args) {
+      const url = (() => {
+        try {
+          return typeof args[0] === 'string' ? args[0] : args[0]?.url;
+        } catch {
+          return null;
+        }
+      })();
+
+      const isViewers = url && /current-viewers\?ids\[\]=(\d+)/.test(url);
+      if (isViewers) sniffedId = Number(url.match(/ids\[\]=(\d+)/)[1]);
+
+      const res = await original.apply(this, args);
+
+      // Read the count straight from the page's own response (clone to not consume it).
+      if (isViewers) {
+        res
+          .clone()
+          .json()
+          .then(([data]) => {
+            if (data) render(data.viewers);
+          })
+          .catch(() => {});
       }
-      return original.apply(this, args);
+
+      return res;
     };
   };
 
@@ -116,7 +138,10 @@
     el.querySelector(`#${CONFIG.nodeId}-num`).textContent = count.toLocaleString();
   };
 
-  // ── Poll ────────────────────────────────────────────────────────────────
+  // ── Poll (fallback) ───────────────────────────────────────────────────────
+  // Primary updates come from installIdSniffer (we ride Kick's own request).
+  // This standalone poll only covers the gap before the page makes its first
+  // call, and keeps the count alive if the page ever stops polling.
   const poll = async () => {
     livestreamId = await resolveId();
     if (!livestreamId) return;
@@ -139,9 +164,9 @@
   };
 
   // ── Boot ────────────────────────────────────────────────────────────────
-  installIdSniffer();
-  await poll();
-  setInterval(poll, CONFIG.pollMs);
+  installIdSniffer(); // primary: update in lockstep with Kick's own requests
+  await poll(); // show something immediately on paste
+  setInterval(poll, CONFIG.pollMs); // safety net if the page goes quiet
 
   // Re-seat if Kick's framework repaints the row and drops our node.
   new MutationObserver(() => {
